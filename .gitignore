@@ -1,0 +1,14 @@
+# Binary
+spicygit
+
+# IDE / tooling
+.claude/
+.serena/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
