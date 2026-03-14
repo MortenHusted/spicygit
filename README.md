@@ -24,6 +24,12 @@ git-spice is excellent for managing stacked branches and PRs, but its CLI workfl
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install MortenHusted/tap/spicygit
+```
+
 ### From source
 
 ```sh
@@ -33,16 +39,10 @@ go install github.com/MortenHusted/spicygit@latest
 Or clone and build:
 
 ```sh
-git clone https://github.com/mhl/spicygit.git
+git clone https://github.com/MortenHusted/spicygit.git
 cd spicygit
 go build -o spicygit .
-# Move to somewhere in your $PATH
-mv spicygit /usr/local/bin/
 ```
-
-### Homebrew (coming soon)
-
-Not yet available.
 
 ## Usage
 
