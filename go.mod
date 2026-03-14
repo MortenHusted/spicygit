@@ -1,4 +1,4 @@
-module spicygit
+module github.com/MortenHusted/spicygit
 
 go 1.24.0
 
