@@ -174,6 +174,12 @@ type cmdResult struct {
 type opDoneMsg struct{}
 type errMsg struct{ err error }
 type tickRefresh struct{}
+
+// needsRestackMsg is sent when a submit fails because a branch needs restacking.
+type needsRestackMsg struct {
+	branch string
+	args   []string // original submit args to retry after restack
+}
 type noGitRepoMsg struct{}
 type noGitSpiceMsg struct{}
 type diffLoaded struct {
@@ -371,6 +377,12 @@ type model struct {
 
 	// Submit mode
 	submitDraft bool // toggle draft status for submit
+	submitForce bool // force submit (bypass restack check)
+
+	// Confirm prompt (y/n)
+	confirmMsg    string   // message to show
+	confirmArgs   []string // args to run on confirm
+	confirmBranch string   // branch for restack+retry
 }
 
 func (m model) visibleItems() []item {
@@ -617,6 +629,21 @@ func (m model) selectedFilePath() string {
 		return ""
 	}
 	return m.files[m.fileCursor].Path
+}
+
+func (m *model) updateSubmitLabel() {
+	label := "PR title"
+	var flags []string
+	if m.submitDraft {
+		flags = append(flags, "DRAFT")
+	}
+	if m.submitForce {
+		flags = append(flags, "FORCE")
+	}
+	if len(flags) > 0 {
+		label += " (" + strings.Join(flags, "+") + ")"
+	}
+	m.inputLabel = label
 }
 
 func (m model) loadDiffForSelected() tea.Cmd {
@@ -890,6 +917,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastCmd = "git-spice upstack onto --branch " + msg.child + " " + newBranch
 		return m, m.runGSBg("upstack", "onto", "--branch", msg.child, newBranch)
 
+	case needsRestackMsg:
+		m.confirmMsg = msg.branch + " needs restacking. Restack and retry submit?"
+		m.confirmArgs = msg.args
+		m.confirmBranch = msg.branch
+
 	case errMsg:
 		m.loading = false
 		if isNotInitedError(msg.err) {
@@ -961,6 +993,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.loading = true
 				return m, doLoad
 			}
+		}
+
+		// Confirm prompt (y/n)
+		if m.confirmMsg != "" {
+			switch msg.String() {
+			case "y":
+				branch := m.confirmBranch
+				args := m.confirmArgs
+				m.confirmMsg = ""
+				m.confirmArgs = nil
+				m.confirmBranch = ""
+				m.lastCmd = "restack + submit " + branch
+				return m, func() tea.Msg {
+					gsBgCmd("branch", "restack", "--branch", branch).CombinedOutput()
+					args = append(args, "--force")
+					cmd := gsBgCmd(args...)
+					out, err := cmd.CombinedOutput()
+					if err != nil {
+						msg := strings.TrimSpace(string(out))
+						if msg != "" {
+							return errMsg{fmt.Errorf("%s", msg)}
+						}
+						return errMsg{err}
+					}
+					return opDoneMsg{}
+				}
+			case "n", "esc":
+				m.confirmMsg = ""
+				m.confirmArgs = nil
+				m.confirmBranch = ""
+			}
+			return m, nil
 		}
 
 		// Branch picker
@@ -1100,33 +1164,69 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "submit":
 					branch := m.pendingBranch
 					m.pendingBranch = ""
-					args := []string{"branch", "submit", "--branch", branch}
-					if text != "" {
-						args = append(args, "--title", text, "--fill")
-					} else {
-						args = append(args, "--fill")
-					}
-					if m.submitDraft {
-						args = append(args, "--draft")
-					}
+					draft := m.submitDraft
+					force := m.submitForce
 					m.lastCmd = "git-spice branch submit " + branch
-					return m, m.runGSBg(args...)
-				case "submit-stack":
-					args := []string{"stack", "submit", "--fill"}
-					if m.submitDraft {
-						args = append(args, "--draft")
+					return m, func() tea.Msg {
+						args := []string{"branch", "submit", "--branch", branch}
+						if text != "" {
+							args = append(args, "--title", text, "--fill")
+						} else {
+							args = append(args, "--fill")
+						}
+						if draft {
+							args = append(args, "--draft")
+						}
+						if force {
+							args = append(args, "--force")
+						}
+						cmd := gsBgCmd(args...)
+						out, err := cmd.CombinedOutput()
+						if err != nil {
+							msg := strings.TrimSpace(string(out))
+							if strings.Contains(msg, "needs to be restacked") && !force {
+								return needsRestackMsg{branch: branch, args: args}
+							}
+							if msg != "" {
+								return errMsg{fmt.Errorf("%s", msg)}
+							}
+							return errMsg{err}
+						}
+						return opDoneMsg{}
 					}
+				case "submit-stack":
+					draft := m.submitDraft
+					force := m.submitForce
 					m.lastCmd = "git-spice stack submit"
-					return m, m.runGSBg(args...)
+					return m, func() tea.Msg {
+						args := []string{"stack", "submit", "--fill"}
+						if draft {
+							args = append(args, "--draft")
+						}
+						if force {
+							args = append(args, "--force")
+						}
+						cmd := gsBgCmd(args...)
+						out, err := cmd.CombinedOutput()
+						if err != nil {
+							msg := strings.TrimSpace(string(out))
+							if msg != "" {
+								return errMsg{fmt.Errorf("%s", msg)}
+							}
+							return errMsg{err}
+						}
+						return opDoneMsg{}
+					}
 				}
 			case "ctrl+d":
 				if m.inputMode == "submit" || m.inputMode == "submit-stack" {
 					m.submitDraft = !m.submitDraft
-					if m.submitDraft {
-						m.inputLabel = "PR title (DRAFT)"
-					} else {
-						m.inputLabel = "PR title"
-					}
+					m.updateSubmitLabel()
+				}
+			case "ctrl+f":
+				if m.inputMode == "submit" || m.inputMode == "submit-stack" {
+					m.submitForce = !m.submitForce
+					m.updateSubmitLabel()
 				}
 			case "backspace", "ctrl+h":
 				if len(m.inputBuf) > 0 {
@@ -1459,7 +1559,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			if n := m.selTracked(); n != nil && !n.isTrunk {
 				m.lastCmd = "git-spice branch restack " + n.branch.Name
-				return m, m.runGSBg("branch", "restack", n.branch.Name)
+				return m, m.runGSBg("branch", "restack", "--branch", n.branch.Name)
 			}
 		case "R":
 			if n := m.selTracked(); n != nil && n.isTrunk {
@@ -1491,14 +1591,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.inputBuf = title
 				m.pendingBranch = n.branch.Name
 				m.submitDraft = false
-				return m, nil
+				m.submitForce = false
+	return m, nil
 			}
 		case "S":
 			m.inputMode = "submit-stack"
 			m.inputLabel = "Stack submit (d:draft, enter:fill from commits)"
 			m.inputBuf = ""
 			m.submitDraft = false
-			return m, nil
+				m.submitForce = false
+return m, nil
 		case "e":
 			if n := m.selTracked(); n != nil && !n.isTrunk {
 				m.lastCmd = "git-spice branch edit " + n.branch.Name
@@ -1534,7 +1636,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "Q":
 			if n := m.selTracked(); n != nil && !n.isTrunk {
 				m.lastCmd = "git-spice branch squash " + n.branch.Name
-				return m, m.runGSBg("branch", "squash", n.branch.Name)
+				return m, m.runGSBg("branch", "squash", "--branch", n.branch.Name)
 			}
 		case "f":
 			if n := m.selTracked(); n != nil && !n.isTrunk {
@@ -2256,6 +2358,13 @@ func (m model) renderCommitContent(width, height int) []string {
 // ---------- status bar ----------
 
 func (m model) renderStatusContent(width int) string {
+	if m.confirmMsg != "" {
+		return stWarning.Render(m.confirmMsg) + "  " +
+			stKey.Render("y") + stDesc.Render(" yes") +
+			stDim.Render(" · ") +
+			stKey.Render("n") + stDesc.Render(" no")
+	}
+
 	if m.inputMode != "" {
 		return stKey.Render(m.inputLabel+": ") + m.inputBuf + "█" +
 			stDim.Render("    enter confirm · esc cancel")
