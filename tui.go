@@ -180,6 +180,57 @@ type needsRestackMsg struct {
 	branch string
 	args   []string // original submit args to retry after restack
 }
+
+// submitEntry represents one branch in the stack submit wizard.
+type submitEntry struct {
+	branch string
+	status string // "create", "update", "up-to-date", "submitting", "done", "error"
+	draft  bool
+	skip   bool
+	result string // result message after submit
+}
+
+// submitDryRunResult is returned after parsing gs stack submit --dry-run.
+type submitDryRunResult struct {
+	entries []submitEntry
+	err     error
+}
+
+// submitBranchDone is sent when one branch finishes submitting.
+type submitBranchDone struct {
+	index  int
+	err    error
+	output string
+}
+
+func parseSubmitDryRun(output string) []submitEntry {
+	var entries []submitEntry
+	seen := map[string]bool{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "WOULD create a CR for ") {
+			branch := strings.TrimPrefix(line, "INF WOULD create a CR for ")
+			if !seen[branch] {
+				entries = append(entries, submitEntry{branch: branch, status: "create"})
+				seen[branch] = true
+			}
+		} else if strings.Contains(line, "WOULD update CR") {
+			// INF WOULD update CR #1234 for branch-name
+			parts := strings.Split(line, " for ")
+			if len(parts) >= 2 {
+				branch := strings.TrimSpace(parts[len(parts)-1])
+				if !seen[branch] {
+					entries = append(entries, submitEntry{branch: branch, status: "update"})
+					seen[branch] = true
+				}
+			}
+		} else if strings.Contains(line, "is up-to-date") {
+			// INF CR #1234 is up-to-date: ...
+			// We don't add these — nothing to do
+		}
+	}
+	return entries
+}
 type noGitRepoMsg struct{}
 type noGitSpiceMsg struct{}
 type diffLoaded struct {
@@ -375,9 +426,14 @@ type model struct {
 	splitBranch    string
 	splitMarkers   map[int]string // commit index → new branch name
 
-	// Submit mode
+	// Submit mode (single branch)
 	submitDraft bool // toggle draft status for submit
 	submitForce bool // force submit (bypass restack check)
+
+	// Submit wizard (stack submit overlay)
+	submitWizard  bool
+	submitEntries []submitEntry
+	submitCursor  int
 
 	// Confirm prompt (y/n)
 	confirmMsg    string   // message to show
@@ -917,6 +973,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastCmd = "git-spice upstack onto --branch " + msg.child + " " + newBranch
 		return m, m.runGSBg("upstack", "onto", "--branch", msg.child, newBranch)
 
+	case submitBranchDone:
+		if m.submitWizard && msg.index < len(m.submitEntries) {
+			if msg.err != nil {
+				m.submitEntries[msg.index].status = "error"
+				m.submitEntries[msg.index].result = msg.output
+			} else {
+				m.submitEntries[msg.index].status = "done"
+				// Extract PR URL from output
+				for _, line := range strings.Split(msg.output, "\n") {
+					if strings.Contains(line, "Created #") || strings.Contains(line, "Updated #") || strings.Contains(line, "up-to-date") {
+						m.submitEntries[msg.index].result = strings.TrimSpace(line)
+						break
+					}
+				}
+				if m.submitEntries[msg.index].result == "" {
+					m.submitEntries[msg.index].result = "submitted"
+				}
+			}
+			// Submit next branch
+			return m, m.submitNextBranch(msg.index + 1)
+		}
+
+	case submitDryRunResult:
+		if msg.err != nil {
+			m.err = msg.err
+		} else if len(msg.entries) == 0 {
+			m.lastCmd = "stack submit: nothing to submit"
+		} else {
+			m.submitWizard = true
+			m.submitEntries = msg.entries
+			m.submitCursor = 0
+			m.submitForce = false
+		}
+
 	case needsRestackMsg:
 		m.confirmMsg = msg.branch + " needs restacking. Restack and retry submit?"
 		m.confirmArgs = msg.args
@@ -1054,6 +1144,73 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Everything else (arrows/tab etc.) falls through below.
 		}
 
+		// Submit wizard overlay
+		if m.submitWizard {
+			// Check if submitting is in progress (block most keys)
+			submitting := false
+			for _, e := range m.submitEntries {
+				if e.status == "submitting" {
+					submitting = true
+					break
+				}
+			}
+
+			if submitting {
+				// Only allow esc while submitting
+				if msg.String() == "esc" {
+					m.submitWizard = false
+					m.submitEntries = nil
+					return m, doLoad
+				}
+				return m, nil
+			}
+
+			switch msg.String() {
+			case "esc":
+				m.submitWizard = false
+				m.submitEntries = nil
+				return m, doLoad
+			case "down":
+				if m.submitCursor < len(m.submitEntries)-1 {
+					m.submitCursor++
+				}
+			case "up":
+				if m.submitCursor > 0 {
+					m.submitCursor--
+				}
+			case "d":
+				if m.submitCursor < len(m.submitEntries) {
+					m.submitEntries[m.submitCursor].draft = !m.submitEntries[m.submitCursor].draft
+				}
+			case "D":
+				allDraft := true
+				for _, e := range m.submitEntries {
+					if !e.draft {
+						allDraft = false
+						break
+					}
+				}
+				for i := range m.submitEntries {
+					m.submitEntries[i].draft = !allDraft
+				}
+			case "x":
+				if m.submitCursor < len(m.submitEntries) {
+					m.submitEntries[m.submitCursor].skip = !m.submitEntries[m.submitCursor].skip
+				}
+			case "f":
+				m.submitForce = !m.submitForce
+			case "enter":
+				cmd := m.submitNextBranch(0)
+				if cmd == nil {
+					m.submitWizard = false
+					m.submitEntries = nil
+					return m, doLoad
+				}
+				return m, cmd
+			}
+			return m, nil
+		}
+
 		// Split mode: marking commits to split a branch
 		if m.splitMode && m.inputMode == "" {
 			switch msg.String() {
@@ -1123,6 +1280,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				switch mode {
 				case "create-branch":
+					if hasCommits() {
+						m.lastCmd = "git-spice branch create " + text
+						return m, func() tea.Msg {
+							ensureTrunk()
+							cmd := gsBgCmd("branch", "create", text, "--no-commit")
+							out, err := cmd.CombinedOutput()
+							if err != nil {
+								msg := strings.TrimSpace(string(out))
+								if msg != "" {
+									return errMsg{fmt.Errorf("%s", msg)}
+								}
+								return errMsg{err}
+							}
+							return opDoneMsg{}
+						}
+					}
 					return m, m.createBranchFallback(text)
 				case "split-name":
 					m.splitMarkers[m.commitCursor] = text
@@ -1546,15 +1719,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Branch operations (Stack panel)
 		case "n":
 			if m.focus == panelStack {
-				if !hasCommits() {
-					m.inputMode = "create-branch"
-					m.inputLabel = "New branch name"
-					m.inputBuf = ""
-					m.setFocus(panelStack)
-					return m, nil
-				}
-				m.lastCmd = "git-spice branch create"
-				return m, m.runGS("branch", "create")
+				m.inputMode = "create-branch"
+				m.inputLabel = "New branch name"
+				m.inputBuf = ""
+				return m, nil
 			}
 		case "r":
 			if n := m.selTracked(); n != nil && !n.isTrunk {
@@ -1595,8 +1763,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 			}
 		case "S":
-			m.lastCmd = "git-spice stack submit"
-			return m, m.runGS("stack", "submit")
+			m.lastCmd = "gs stack submit --dry-run"
+			return m, func() tea.Msg {
+				cmd := gsBgCmd("stack", "submit", "--dry-run", "--force", "--fill", "--no-prompt")
+				out, _ := cmd.CombinedOutput()
+				entries := parseSubmitDryRun(string(out))
+				return submitDryRunResult{entries: entries}
+			}
 		case "e":
 			if n := m.selTracked(); n != nil && !n.isTrunk {
 				m.lastCmd = "git-spice branch edit " + n.branch.Name
@@ -1688,6 +1861,49 @@ func (m model) stageToggle(f fileStatus) tea.Cmd {
 		}
 		return filesReloaded{files: loadFileStatuses()}
 	}
+}
+
+// submitNextBranch finds the next non-skipped entry at or after startIdx and submits it.
+func (m model) submitNextBranch(startIdx int) tea.Cmd {
+	for i := startIdx; i < len(m.submitEntries); i++ {
+		e := m.submitEntries[i]
+		if e.skip || e.status == "done" || e.status == "error" {
+			continue
+		}
+		m.submitEntries[i].status = "submitting"
+		force := m.submitForce
+		idx := i
+		entry := e
+		return func() tea.Msg {
+			args := []string{"branch", "submit", "--branch", entry.branch, "--fill"}
+			if entry.draft {
+				args = append(args, "--draft")
+			}
+			if force {
+				args = append(args, "--force")
+			}
+			cmd := gsBgCmd(args...)
+			out, err := cmd.CombinedOutput()
+			outStr := strings.TrimSpace(string(out))
+			if err != nil {
+				// Auto-restack if needed
+				if strings.Contains(outStr, "needs to be restacked") {
+					gsBgCmd("branch", "restack", "--branch", entry.branch).CombinedOutput()
+					args = append(args, "--force")
+					cmd2 := gsBgCmd(args...)
+					out2, err2 := cmd2.CombinedOutput()
+					if err2 != nil {
+						return submitBranchDone{index: idx, err: err2, output: strings.TrimSpace(string(out2))}
+					}
+					return submitBranchDone{index: idx, output: strings.TrimSpace(string(out2))}
+				}
+				return submitBranchDone{index: idx, err: err, output: outStr}
+			}
+			return submitBranchDone{index: idx, output: outStr}
+		}
+	}
+	// All done — no more branches
+	return nil
 }
 
 func (m model) discardFile(f fileStatus) tea.Cmd {
@@ -1853,6 +2069,9 @@ func (m model) View() string {
 	}
 	if m.showHelp {
 		return m.overlayHelp()
+	}
+	if m.submitWizard {
+		return m.overlaySubmitWizard()
 	}
 	return m.renderPanels()
 }
@@ -2630,6 +2849,139 @@ func (m model) overlayHelp() string {
 		// Right portion: cut away startX+popW columns from the left, keep the rest.
 		rightStart := startX + popW
 		rightBg := ansi.TruncateLeft(bg, rightStart, "")
+		bgLines[y] = leftBg + popLine + rightBg
+	}
+
+	if len(bgLines) > m.height {
+		bgLines = bgLines[:m.height]
+	}
+	return strings.Join(bgLines, "\n")
+}
+
+// ---------- submit wizard overlay ----------
+
+func (m model) overlaySubmitWizard() string {
+	bg := m.renderPanels()
+
+	b := stBorderActive.Render
+	boxInner := 60
+	if boxInner > m.width-6 {
+		boxInner = m.width - 6
+	}
+
+	blank := b("│") + strings.Repeat(" ", boxInner) + b("│")
+	wrap := func(content string) string {
+		return b("│") + padTo(content, boxInner) + b("│")
+	}
+
+	var popLines []string
+
+	// Top border
+	title := stTitle.Render(" Stack Submit ")
+	titleW := lipgloss.Width(title)
+	topFill := boxInner - titleW
+	if topFill < 0 {
+		topFill = 0
+	}
+	popLines = append(popLines, b("┌")+title+b(strings.Repeat("─", topFill)+"┐"))
+	popLines = append(popLines, blank)
+
+	// Force indicator
+	forceStr := stDim.Render("off")
+	if m.submitForce {
+		forceStr = stWarning.Render("ON")
+	}
+	popLines = append(popLines, wrap("  "+stDesc.Render("Force: ")+forceStr+stDim.Render("   [f] toggle  [D] draft all")))
+	popLines = append(popLines, blank)
+
+	// Column header
+	popLines = append(popLines, wrap("  "+stDim.Render("  Status   Branch")))
+
+	// Entries
+	for i, e := range m.submitEntries {
+		var statusIcon string
+		switch {
+		case e.status == "submitting":
+			statusIcon = stWarning.Render("  ⟳   ")
+		case e.status == "done":
+			statusIcon = stPROpen.Render("  ✓   ")
+		case e.status == "error":
+			statusIcon = stErr.Render("  ✗   ")
+		case e.skip:
+			statusIcon = stDim.Render("SKIP  ")
+		case e.draft:
+			statusIcon = stWarning.Render("DRAFT ")
+		case e.status == "create":
+			statusIcon = stPROpen.Render("NEW   ")
+		case e.status == "update":
+			statusIcon = stCurrent.Render("UPDATE")
+		default:
+			statusIcon = stDim.Render("      ")
+		}
+
+		branchName := e.branch
+		// Show result message for completed entries
+		if e.result != "" {
+			branchName = e.branch + "  " + stDim.Render(e.result)
+		}
+		maxBranch := boxInner - 14
+		if len(branchName) > maxBranch {
+			branchName = branchName[:maxBranch-1] + "…"
+		}
+
+		line := "  " + statusIcon + "  " + branchName
+
+		if i == m.submitCursor {
+			content := "▸ " + statusIcon + "  " + branchName
+			vis := lipgloss.Width(content)
+			if vis < boxInner {
+				content += strings.Repeat(" ", boxInner-vis)
+			}
+			popLines = append(popLines, b("│")+stSel.Render(content)+b("│"))
+		} else {
+			popLines = append(popLines, wrap(line))
+		}
+	}
+
+	popLines = append(popLines, blank)
+
+	// Key hints
+	hints := "  " +
+		stKey.Render("d") + stDesc.Render(" draft") + "  " +
+		stKey.Render("x") + stDesc.Render(" skip") + "  " +
+		stKey.Render("enter") + stDesc.Render(" submit") + "  " +
+		stKey.Render("esc") + stDesc.Render(" cancel")
+	popLines = append(popLines, wrap(hints))
+	popLines = append(popLines, blank)
+
+	// Bottom border
+	popLines = append(popLines, b("└"+strings.Repeat("─", boxInner)+"┘"))
+
+	// Composite onto background
+	bgLines := strings.Split(bg, "\n")
+	for len(bgLines) < m.height {
+		bgLines = append(bgLines, strings.Repeat(" ", m.width))
+	}
+
+	popH := len(popLines)
+	popW := boxInner + 2
+	startY := (m.height - popH) / 2
+	if startY < 0 {
+		startY = 0
+	}
+	startX := (m.width - popW) / 2
+	if startX < 0 {
+		startX = 0
+	}
+
+	for i, popLine := range popLines {
+		y := startY + i
+		if y >= len(bgLines) {
+			break
+		}
+		bgLine := bgLines[y]
+		leftBg := ansi.Truncate(bgLine, startX, "")
+		rightBg := ansi.TruncateLeft(bgLine, startX+popW, "")
 		bgLines[y] = leftBg + popLine + rightBg
 	}
 
