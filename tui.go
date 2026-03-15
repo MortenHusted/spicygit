@@ -1595,12 +1595,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 			}
 		case "S":
-			m.inputMode = "submit-stack"
-			m.inputLabel = "Stack submit (d:draft, enter:fill from commits)"
-			m.inputBuf = ""
-			m.submitDraft = false
-				m.submitForce = false
-return m, nil
+			m.lastCmd = "git-spice stack submit"
+			return m, m.runGS("stack", "submit")
 		case "e":
 			if n := m.selTracked(); n != nil && !n.isTrunk {
 				m.lastCmd = "git-spice branch edit " + n.branch.Name
